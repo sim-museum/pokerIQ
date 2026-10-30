@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QGraphicsRectItem, QDialog, QDialogButtonBox, QCheckBox, QGroupBox,
     QTabWidget, QTextEdit, QTextBrowser, QScrollArea, QComboBox,
     QFormLayout, QProgressBar, QSizePolicy, QGridLayout, QFileDialog,
+    QToolTip,
 )
 from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, QSettings, QThread, pyqtSignal
 from PyQt6.QtGui import (
@@ -2909,239 +2910,127 @@ class MetricPie(QWidget):
 
 
 class MetricDashboard(QWidget):
-    """Stack of MetricBars for the glanceable decision strip.
+    """Decision scorecard (METRICS-2, 2026-10-29): nine metrics as one painted table of
+    bullet graphs (Few), in three groups, under an action title that states the most
+    urgent verdict.
 
-    Includes:
-      • Equity (with pot-odds threshold tick)
-      • Pot odds  (call price as % of pot-after-call)
-      • Implied break-even %  (price ÷ (pot + price + 0.5·stack))
-      • SPR after call (0..10 capped)
-      • Pot Commitment % (price ÷ current stack)
-      • Outs (0..20)
-      • Nash push gauge — only shown if hero stack ≤ 15 BB
+    Each row: the metric's name and source; its value in large type; a bullet bar (grey
+    qualitative bands, darkest = worst; the value in the accent blue; a white target
+    mark); and a verdict as an icon plus words in the status colour, never colour alone.
+    Hover a row for its full explanation.
+
+      Facing a bet   MDF · Harrington's M (stack depth) · range advantage
+      This hand      reverse implied risk · Nash push (<= 15 BB) · realized vs raw equity
+      You            VPIP / PFR / AGF · tilt · bankroll depth in buy-ins, which becomes
+                     Chen's risk of ruin from 100 lifetime hands
     """
+
+    ACCENT = QColor(66, 150, 240)
+    GOOD, WARN, BAD = QColor(12, 163, 12), QColor(250, 178, 25), QColor(208, 59, 59)
+    MUTED = QColor(140, 140, 140)
+    TEXT = QColor(235, 235, 235)
+    SURFACE = QColor(24, 24, 24)
+    # qualitative bands, darkest = worst (as in the stats panel's bullet graphs)
+    BAND = {"bad": QColor(46, 46, 46), "warn": QColor(68, 68, 68), "good": QColor(94, 94, 94),
+            "none": QColor(50, 50, 50)}
+    ICON = {"good": "▲", "warn": "◆", "bad": "▼", "info": "•"}
+    GROUPS = (("Facing a bet", ("mdf", "m_ratio", "range_adv")),
+              ("This hand", ("reverse_implied", "nash", "realized")),
+              ("You", ("hero_vpip", "tilt", "bankroll")))
+    TIPS = {
+        'mdf': (
+            "Minimum Defense Frequency (MDF, Sklansky Ch 12)\n\n"
+            "    MDF = pot ÷ (pot + bet)\n\n"
+            "Facing a bet: the fraction of your range you MUST continue with (call + raise) "
+            "so villain cannot profitably bluff any two cards.\n"
+            "Its complement, 1 − MDF, is the bluff frequency that makes a bluff-catching "
+            "call break even."),
+        'm_ratio': (
+            "Stack depth: Harrington's M (Harrington on Hold'em, Vol. 2)\n\n"
+            "    M = your stack ÷ (small blind + big blind + antes)\n\n"
+            "How many rounds you can survive without playing a hand; the blinds here rise "
+            "every 10 hands, as in a tournament.\n"
+            "  M ≥ 20   green zone: play your full game.\n"
+            "  10–20    yellow: tighten, fewer speculative hands.\n"
+            "  6–10     orange: open-raise or move in, little calling.\n"
+            "  1–6      red: push or fold.\n"
+            "  < 1      dead: move in with any reasonable hand."),
+        'range_adv': (
+            "Range Advantage (Acevedo)\n\n"
+            "Estimate of how well your preflop range fits the board against villain's "
+            "defending range.\n"
+            "  + : YOU benefit from this texture (bet more often).\n"
+            "  − : villain's range fits better; slow down with marginal made hands.\n"
+            "Heuristic from preflop initiative + board high-card fit."),
+        'reverse_implied': (
+            "Reverse Implied Odds (risk)\n\n"
+            "How much extra you can expect to LOSE when you make a hand that's still "
+            "second-best: small flush vs nut flush, low kicker on top pair, set into a "
+            "straight. Expressed as a % of your remaining stack at risk."),
+        'nash': (
+            "Nash push range (short stack; Chen & Ankenman)\n\n"
+            "Only when your stack is 15 BB or less. The bar is your hand's strength "
+            "percentile; the white mark is where the heads-up Nash shoving range starts. "
+            "Past the mark: SHOVE; short of it: FOLD."),
+        'realized': (
+            "Realized vs Raw Equity\n\n"
+            "How much of your THEORETICAL equity you actually win, averaged across the "
+            "hands you've played this session. The white mark is 100%.\n"
+            "  < 100%  spewing post-flop with marginal hands (out of position, bad reads).\n"
+            "  > 100%  squeezing extra value (in position, sharp reads)."),
+        'hero_vpip': (
+            "Your session VPIP / PFR / AGF\n\n"
+            "  VPIP (the bar) = % of hands you voluntarily put money in.\n"
+            "  PFR (the white mark) = % of hands you raised preflop (always ≤ VPIP).\n"
+            "  AGF = postflop (bets + raises) ÷ calls.\n"
+            "Bands: VPIP 16–30% is the tight-aggressive sweet spot (Hilger Ch 8); "
+            "12–16 or 30–40% workable; outside that, too tight or too loose.\n"
+            "Healthy ranges: VPIP 18–24, PFR 14–20, AGF 2–4."),
+        'tilt': (
+            "Tilt Score (Hilger Ch 6)\n\n"
+            "0–100, from decision-time variance and pattern deviation in your recent "
+            "actions.\n  < 25 calm  ·  25–40 watch  ·  > 40 TILT: step away."),
+        'bankroll': (
+            "Bankroll depth, then Risk of Ruin (Chen & Ankenman Ch 22; Hilger Ch 7)\n\n"
+            "Until you have 100 lifetime hands (counted across every game, not just this "
+            "one), your win rate is unknown, so risk of ruin can't be estimated. The tile "
+            "shows your bankroll in buy-ins instead: bankroll ÷ buy-in. The usual guide for "
+            "no-limit cash play is 20–30 buy-ins; under 10 is thin.\n\n"
+            "From 100 hands on it shows Chen's risk of ruin:\n"
+            "    ROR ≈ exp(−2 · μ · B ÷ σ²)\n"
+            "μ = win rate per hand, B = bankroll, σ = standard deviation per hand.\n"
+            "  < 1% safe  ·  1–5% consider moving down  ·  > 5% bankroll too thin.\n"
+            "Set your bankroll under Review → Variance / Edge / Bankroll dashboard."),
+    }
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # Pie/donut grid — better use of the narrow right-hand column
-        # than the long horizontal bars. Each pie gauges one metric;
-        # see the tooltips for what each one means.
-        from PyQt6.QtWidgets import QGridLayout as _QGridLayout
-        grid = _QGridLayout(self)
-        grid.setContentsMargins(6, 4, 6, 4)
-        grid.setHorizontalSpacing(4)
-        grid.setVerticalSpacing(4)
-        TIPS = {
-            'equity': (
-                "Equity vs ranges\n\n"
-                "Your hand's chance to win at showdown against each "
-                "opponent's estimated range (Monte Carlo).\n"
-                "The YELLOW TICK is the pot-odds threshold — fill "
-                "extending past the tick = profitable call on immediate "
-                "equity alone.\n"
-                "Color: green = beats pot odds, amber = borderline, "
-                "red = falls short."),
-            'pot_odds': (
-                "Pot odds (required equity)\n\n"
-                "The break-even equity for a call:  call / (pot + call).\n"
-                "If your hand equity ≥ this number you have a profitable "
-                "call on immediate equity, before considering implied "
-                "odds.\n"
-                "On an unraised preflop limp the tag '(BB)' marks the "
-                "metric as non-binding — you're paying the BB to enter, "
-                "not a real bet."),
-            'implied': (
-                "Implied break-even %\n\n"
-                "Equity you'd need to break even IF you collect future "
-                "bets when you hit (≈ 50% of avg opponent stack).\n"
-                "Much lower than pot odds → set-mining / drawing-hand "
-                "spots become profitable below the immediate-equity "
-                "threshold."),
-            'reverse_implied': (
-                "Reverse Implied Odds (risk)\n\n"
-                "How much extra you can expect to LOSE when you make a "
-                "hand that's still second-best — small flush vs nut "
-                "flush, low kicker on top pair, set into straight.\n"
-                "Expressed as a % of your remaining stack at risk.\n"
-                "  • Higher = the hand is dominated-prone.\n"
-                "  • Sklansky: 'matters most with hands that are good "
-                "now but vulnerable to being out-kicked or out-drawn'."),
-            'spr': (
-                "Stack-to-Pot Ratio (SPR) after call\n\n"
-                "(remaining stack) / (post-call pot).\n"
-                "  • SPR < 1   POT-COMMITTED — can't fold to later bets.\n"
-                "  • SPR 1–3  decision band — calling commits you next "
-                "street.\n"
-                "  • SPR ≥ 3   flexible — room to fold future pressure.\n"
-                "Smaller SPR favors all-in tactics with one pair / "
-                "draws; larger SPR favors set-mining and implied odds."),
-            'commit': (
-                "Pot Commitment %\n\n"
-                "Fraction of your CURRENT stack you're about to put in.\n"
-                "  • ≥ 33% effectively committed — almost certainly\n"
-                "          can't fold next street; proceed only with\n"
-                "          a hand you'll play.\n"
-                "  • 15–33% meaningful commitment, plan ahead.\n"
-                "  • < 15% light — easy to fold to future pressure."),
-            'outs': (
-                "Outs\n\n"
-                "Number of cards left in the deck that turn your hand "
-                "into a likely winner (eval7-driven, same count as the "
-                "Hero tab grid).\n"
-                "Rule of 4/2: multiply by 4 (flop→river) or by 2 "
-                "(turn→river) for approximate % to hit.\n"
-                "Color: ≥9 outs = strong draw, 4–8 = workable, ≤3 = "
-                "long-shot."),
-            'nash': (
-                "Nash push range (short stack)\n\n"
-                "Only appears when hero stack ≤ 15 BB.\n"
-                "Shows the percentage of all 169 hand combos that "
-                "should shove at this stack depth (Chen/Ankenman SB-vs-"
-                "BB heads-up Nash).\n"
-                "The YELLOW TICK is your hand's strength percentile — "
-                "if your bar extends past the tick, SHOVE; otherwise "
-                "FOLD."),
-            'mdf': (
-                "Minimum Defense Frequency (MDF, Sklansky Ch 12)\n\n"
-                "    MDF = pot ÷ (pot + bet)\n\n"
-                "Facing a bet: the fraction of your range you MUST "
-                "continue with (call + raise) so villain cannot "
-                "profitably bluff any two cards.\n"
-                "If your actual defense rate < MDF, exploitable bluffs "
-                "become +EV for villain."),
-            'bluff_catch': (
-                "Bluff-Catch Threshold (Sklansky Ch 19 / Chen Ch 13)\n\n"
-                "    bluff% = bet ÷ (pot + bet)\n\n"
-                "The villain's bluff frequency that makes calling "
-                "break-even with a bluff-catcher.\n"
-                "If you think villain bluffs MORE often than this, the "
-                "call is profitable; less, fold.\n"
-                "Equal to 1 − MDF (same game-theoretic indifference)."),
-            'range_adv': (
-                "Range Advantage (Acevedo)\n\n"
-                "Estimate of how well your preflop range fits the "
-                "current board vs. villain's defending range.\n"
-                "  +X% green  : YOU benefit from this texture (drives "
-                "high c-bet frequency).\n"
-                "  −X% red    : villain has the better range fit; "
-                "slow down with marginal made hands.\n"
-                "Heuristic from preflop initiative + board high-card "
-                "fit."),
-            'tilt': (
-                "Tilt Score (Hilger Ch 6)\n\n"
-                "0–100 indicator based on decision-time variance + "
-                "pattern deviation across your recent actions.\n"
-                "  < 25  Calm — baseline.\n"
-                "  25–40 Watch — minor deviation.\n"
-                "  > 40  TILT — step away, breathe, re-engage Mindset "
-                "attitudes 1–6."),
-            'hero_vpip': (
-                "Hero session: VPIP / PFR / AGF\n\n"
-                "Three values, one tile.\n"
-                "  • VPIP (the BIG % in the centre, and the strip's\n"
-                "    fill length)\n"
-                "       = % of hands you voluntarily put $ in.\n"
-                "  • PFR (the YELLOW TICK on the horizontal strip)\n"
-                "       = % of hands you raised preflop. PFR is\n"
-                "         always ≤ VPIP, so the tick sits at or\n"
-                "         below the bar's end.\n"
-                "  • AGF (the small label under the centre %)\n"
-                "       = Aggression Factor on postflop streets\n"
-                "       = (bets + raises) ÷ calls.\n\n"
-                "Strip-fill colour bands (deviation from TAG):\n"
-                "  RED   = VPIP outside 12–40 % (too tight or way\n"
-                "          too loose — likely calling-station or\n"
-                "          nit).\n"
-                "  AMBER = VPIP 12–16 or 30–40 % (workable but off\n"
-                "          centre).\n"
-                "  GREEN = VPIP 16–30 % (Tight-Aggressive sweet\n"
-                "          spot, Hilger Ch 8).\n\n"
-                "Healthy ranges: VPIP 18–24, PFR 14–20, AGF 2–4.\n"
-                "Use this to spot drift — too tight, too spewy, too "
-                "passive."),
-            'ror': (
-                "Risk of Ruin (Chen Ch 22)\n\n"
-                "    ROR ≈ exp(−2 · μ · B ÷ σ²)\n"
-                "where μ = win rate, B = bankroll, σ = std-dev.\n\n"
-                "Lifetime probability of going broke at the current "
-                "edge / bankroll.\n"
-                "  < 1%  : safe (Half-Kelly territory).\n"
-                "  1–5%  : moderate — consider moving down.\n"
-                "  > 5%  : DANGER — your bankroll is too thin for the "
-                "stake."),
-            'realized': (
-                "Realized vs Raw Equity\n\n"
-                "How much of your THEORETICAL equity you actually win, "
-                "averaged across the hands you've played this session.\n"
-                "  100% = realising full equity.\n"
-                "  < 100%  spewing post-flop with marginals (out of "
-                "          position, bad reads).\n"
-                "  > 100%  squeezing extra value (in position, sharp "
-                "          reads).\n"
-                "Sklansky / Acevedo: position + read quality drive "
-                "realization."),
-        }
-        def _make_pie(label, tip):
-            pie = MetricPie(label)
-            pie.setToolTip(tip)
-            return pie
+        self.setMinimumSize(520, 470)
+        self.setMouseTracking(True)
+        self._rows = {}            # key -> row dict (see _row)
+        self._row_rects = []       # [(QRectF, key)] for hover tooltips
+        self._title = "Waiting for the first decision"
+        self.update_metrics(equity_pct=None, pot_odds_pct=None, implied_pct=None, spr=None,
+                            commit_pct=None, outs=None, stack_bb=None)
 
-        # 3×3 grid covering nine decision-relevant metrics, grouped:
-        #   Row 0 (BET-DEFENSE math, GTO):
-        #     MDF / Bluff-catch threshold / Range advantage
-        #   Row 1 (HAND-SPECIFIC risk):
-        #     Reverse implied / Nash push range / Realized equity
-        #   Row 2 (META-GAME and bankroll):
-        #     Hero VPIP/PFR/AGF / Tilt / Risk of Ruin
-        self.mdf_pie = _make_pie(
-            "MDF — min\ndefense freq", TIPS['mdf'])
-        grid.addWidget(self.mdf_pie, 0, 0)
-        self.bluff_catch_pie = _make_pie(
-            "Bluff-catch\nthreshold", TIPS['bluff_catch'])
-        grid.addWidget(self.bluff_catch_pie, 0, 1)
-        self.range_adv_pie = _make_pie(
-            "Range\nadvantage", TIPS['range_adv'])
-        grid.addWidget(self.range_adv_pie, 0, 2)
+    # ---- rows -------------------------------------------------------------------------
+    @staticmethod
+    def _row(label, source, value=None, lo=0.0, hi=100.0, bands=(), target=None, mark=None,
+             text="—", kind=None, words="", origin=None):
+        """One scorecard row. bands = [(from, to, 'good'|'warn'|'bad')]; target = the white
+        mark; mark = a second, smaller mark (PFR); origin = the bar's baseline (diverging
+        rows); kind = verdict status ('good'/'warn'/'bad'/'info') or None for no verdict."""
+        return dict(label=label, source=source, value=value, lo=lo, hi=hi, bands=bands,
+                    target=target, mark=mark, text=text, kind=kind, words=words,
+                    origin=lo if origin is None else origin)
 
-        self.reverse_implied_pie = _make_pie(
-            "Reverse implied\n(domination)", TIPS['reverse_implied'])
-        grid.addWidget(self.reverse_implied_pie, 1, 0)
-        self.nash_pie = _make_pie(
-            "Nash push\n(≤ 15 BB)", TIPS['nash'])
-        grid.addWidget(self.nash_pie, 1, 1)
-        self.realized_pie = _make_pie(
-            "Realized vs\nraw equity", TIPS['realized'])
-        grid.addWidget(self.realized_pie, 1, 2)
-
-        self.hero_vpip_pie = _make_pie(
-            "Hero session\nVPIP / PFR / AGF", TIPS['hero_vpip'])
-        grid.addWidget(self.hero_vpip_pie, 2, 0)
-        self.tilt_pie = _make_pie(
-            "Tilt score\n(Hilger)", TIPS['tilt'])
-        grid.addWidget(self.tilt_pie, 2, 1)
-        self.ror_pie = _make_pie(
-            "Risk of Ruin\n(Chen)", TIPS['ror'])
-        grid.addWidget(self.ror_pie, 2, 2)
-
-        # Hidden placeholders so any code still poking at the removed
-        # pies (equity / pot odds / implied / commit / outs / spr)
-        # doesn't trip on AttributeError. Equity / Pot odds / etc are
-        # already shown in the strip above the panel.
-        for name in ('equity_pie', 'potodds_pie', 'implied_pie',
-                     'spr_pie', 'commit_pie', 'outs_pie'):
-            placeholder = _make_pie("", "")
-            placeholder.setVisible(False)
-            setattr(self, name, placeholder)
-
-        # All three rows + cols expand evenly.
-        for r in range(3):
-            grid.setRowStretch(r, 1)
-        for c in range(3):
-            grid.setColumnStretch(c, 1)
-        self.setStyleSheet(
-            "MetricDashboard { background: #181818;"
-            " border: 1px solid #333; border-radius: 6px; }"
-        )
+    @staticmethod
+    def _zone(v, cuts):
+        """cuts = [(upper, kind, words), ...] ascending; the first upper bound above v."""
+        for upper, kind, words in cuts:
+            if v < upper:
+                return kind, words
+        return cuts[-1][1], cuts[-1][2]
 
     def update_metrics(
         self, *, equity_pct: float | None, pot_odds_pct: float | None,
@@ -3150,7 +3039,6 @@ class MetricDashboard(QWidget):
         stack_bb: float | None, hero_hand=None,
         unraised_preflop: bool = False,
         reverse_implied_pct: float | None = None,
-        # ----- New (Phase-9) decision-dashboard metrics -----
         mdf_pct: float | None = None,
         bluff_catch_pct: float | None = None,
         range_adv_pct: float | None = None,
@@ -3160,212 +3048,219 @@ class MetricDashboard(QWidget):
         hero_agf: float | None = None,
         ror_pct: float | None = None,
         realized_ratio_pct: float | None = None,
+        ror_note: str | None = None,
+        m_ratio: float | None = None,
+        bankroll_buyins: float | None = None,
+        lifetime_hands: int | None = None,
     ):
-        # Equity — pot-odds tick + color verdict
-        if equity_pct is None:
-            self.equity_pie.set_metric(0, 100, "--", color="#0af", dim=True)
-        else:
-            tick = (pot_odds_pct if pot_odds_pct and not unraised_preflop
-                    else None)
-            if unraised_preflop or pot_odds_pct is None:
-                col = "#0af"
-            elif equity_pct >= pot_odds_pct:
-                col = "#88ff88"
-            elif equity_pct >= pot_odds_pct * 0.75:
-                col = "#ffd966"
-            else:
-                col = "#ff7777"
-            self.equity_pie.set_metric(
-                equity_pct, 100, f"{equity_pct:.0f}%",
-                tick=tick, color=col)
-
-        # Pot odds
-        if pot_odds_pct is None:
-            self.potodds_pie.set_metric(0, 100, "--", color="#f80", dim=True)
-        else:
-            tag = "" if not unraised_preflop else "BB"
-            ctr = (f"{pot_odds_pct:.0f}%\n{tag}"
-                   if tag else f"{pot_odds_pct:.0f}%")
-            self.potodds_pie.set_metric(
-                pot_odds_pct, 100, ctr,
-                color="#f80", dim=unraised_preflop)
-
-        # Implied break-even — a very low number means deep implied odds.
-        if implied_pct is None:
-            self.implied_pie.set_metric(0, 50, "--", color="#a8f", dim=True)
-        else:
-            self.implied_pie.set_metric(
-                implied_pct, 50, f"{implied_pct:.1f}%",
-                color="#a8f")
-
-        # Reverse implied — heuristic "stack-at-risk" %.
-        if reverse_implied_pct is None:
-            self.reverse_implied_pie.set_metric(
-                0, 30, "--", color="#a8f", dim=True)
-        else:
-            if reverse_implied_pct >= 20:
-                col = "#ff7777"
-            elif reverse_implied_pct >= 10:
-                col = "#ffd966"
-            else:
-                col = "#88ff88"
-            self.reverse_implied_pie.set_metric(
-                reverse_implied_pct, 30,
-                f"{reverse_implied_pct:.0f}%", color=col)
-
-        # SPR after call (cap at 10 — anything above is "very deep").
-        if spr is None:
-            self.spr_pie.set_metric(0, 10, "--", color="#0af", dim=True)
-        else:
-            if spr < 1:
-                col = "#ff7777"
-            elif spr < 3:
-                col = "#ffd966"
-            else:
-                col = "#88ff88"
-            self.spr_pie.set_metric(
-                min(spr, 10), 10, f"{spr:.1f}", color=col)
-
-        # Pot commitment % — > 33 % = effectively committed.
-        if commit_pct is None:
-            self.commit_pie.set_metric(0, 100, "--", color="#0af", dim=True)
-        else:
-            if commit_pct >= 33:
-                col = "#ff7777"
-            elif commit_pct >= 15:
-                col = "#ffd966"
-            else:
-                col = "#88ff88"
-            self.commit_pie.set_metric(
-                commit_pct, 100, f"{commit_pct:.0f}%", color=col)
-
-        # Outs (0..20)
-        if outs is None:
-            self.outs_pie.set_metric(0, 20, "--", color="#0f0", dim=True)
-        else:
-            col = ("#88ff88" if outs >= 9
-                   else "#ffd966" if outs >= 4 else "#aaaaaa")
-            self.outs_pie.set_metric(
-                min(outs, 20), 20, f"{outs}", color=col)
-
-        # Nash push gauge — active when stack ≤ 15 BB; dim/--
-        # otherwise so the slot stays visible in the 3×3 grid.
-        if stack_bb is not None and stack_bb <= 15:
-            push_pct = nash_push_pct(stack_bb) * 100
-            verdict = ""
-            tick = None
-            if hero_hand and len(hero_hand) >= 2:
-                pct = hand_strength_percentile(hero_hand) * 100
-                in_range = pct >= (100 - push_pct)
-                verdict = ("\nSHOVE" if in_range else "\nFOLD")
-                tick = 100 - push_pct
-            col = "#ff7777" if stack_bb <= 6 else "#ffd966"
-            self.nash_pie.set_metric(
-                push_pct, 100,
-                f"{push_pct:.0f}%{verdict}",
-                tick=tick, color=col)
-        else:
-            self.nash_pie.set_metric(
-                0, 100, "n/a",
-                color="#0af", dim=True)
-
-        # ---------- Phase-9 dashboard metrics ----------
-        # MDF — min defense frequency. Active only when facing a bet.
+        """Rebuild the rows. Equity, pot odds, implied odds, SPR, commitment and outs are
+        shown in the strip above the panel; they are accepted here and not drawn."""
+        R = self._row
+        rows = {}
+        # -- facing a bet
         if mdf_pct is None:
-            self.mdf_pie.set_metric(0, 100, "--",
-                                     color="#a8f", dim=True)
+            rows['mdf'] = R("Defend at least", "MDF, Sklansky", words="no bet to face", kind="info")
         else:
-            col = ("#88ff88" if mdf_pct < 50
-                   else "#ffd966" if mdf_pct < 70 else "#ff7777")
-            self.mdf_pie.set_metric(
-                mdf_pct, 100, f"{mdf_pct:.0f}%", color=col)
-
-        # Bluff-catch threshold — the bluff% needed for breakeven call.
-        if bluff_catch_pct is None:
-            self.bluff_catch_pie.set_metric(0, 100, "--",
-                                             color="#a8f", dim=True)
+            rows['mdf'] = R("Defend at least", "MDF, Sklansky", mdf_pct, 0, 100, text=f"{mdf_pct:.0f}%",
+                            kind="info", words="of your range must continue")
+        if m_ratio is None:
+            rows['m_ratio'] = R("Stack depth M", "Harrington zones", lo=0, hi=30,
+                                words="all-in or no stack" if stack_bb == 0 else "", kind="info")
         else:
-            self.bluff_catch_pie.set_metric(
-                bluff_catch_pct, 100,
-                f"{bluff_catch_pct:.0f}%",
-                color="#a8f")
-
-        # Range advantage — symmetric ±X% scale; render absolute on
-        # a 0..30 axis with color denoting sign (green = hero, red =
-        # villain).
+            kind, words = self._zone(m_ratio, [(1, "bad", "dead: move in now"), (6, "bad", "red zone: push or fold"),
+                                               (10, "warn", "orange: raise or shove"),
+                                               (20, "warn", "yellow: tighten up"), (1e9, "good", "green zone: full game")])
+            rows['m_ratio'] = R("Stack depth M", "Harrington zones", min(m_ratio, 30), 0, 30,
+                                bands=((0, 6, "bad"), (6, 20, "warn"), (20, 30, "good")), target=20,
+                                text=f"{m_ratio:.0f}" if m_ratio >= 10 else f"{m_ratio:.1f}",
+                                kind=kind, words=words)
         if range_adv_pct is None:
-            self.range_adv_pie.set_metric(0, 30, "--",
-                                           color="#a8f", dim=True)
+            rows['range_adv'] = R("Range advantage", "Acevedo", lo=-30, hi=30, origin=0, words="before the flop",
+                                  kind="info")
         else:
-            mag = min(30.0, abs(range_adv_pct))
-            sign = "+" if range_adv_pct >= 0 else "−"
-            col = ("#88ff88" if range_adv_pct >= 3
-                   else "#ff7777" if range_adv_pct <= -3
-                   else "#aaaaaa")
-            self.range_adv_pie.set_metric(
-                mag, 30, f"{sign}{mag:.0f}%", color=col)
-
-        # Tilt score — Hilger's 0-100 mental state indicator.
-        if tilt_score is None:
-            self.tilt_pie.set_metric(0, 100, "--",
-                                      color="#a8f", dim=True)
+            v = max(-30.0, min(30.0, range_adv_pct))
+            kind, words = (("good", "your range fits the board") if v >= 3 else
+                           ("bad", "their range fits better") if v <= -3 else ("info", "even"))
+            rows['range_adv'] = R("Range advantage", "Acevedo", v, -30, 30,
+                                  bands=((-30, -3, "bad"), (-3, 3, "warn"), (3, 30, "good")), target=0, origin=0,
+                                  text=f"{range_adv_pct:+.0f}%", kind=kind, words=words)
+        # -- this hand
+        if reverse_implied_pct is None:
+            rows['reverse_implied'] = R("Reverse implied risk", "domination", lo=0, hi=30)
         else:
-            col = ("#88ff88" if tilt_score < 25
-                   else "#ffd966" if tilt_score < 40
-                   else "#ff7777")
-            self.tilt_pie.set_metric(
-                tilt_score, 100, f"{tilt_score}",
-                color=col)
-
-        # Hero VPIP / PFR / AGF — fill = VPIP, tick = PFR, label tag
-        # shows AGF (a non-percentage scalar).
-        if hero_vpip_pct is None:
-            self.hero_vpip_pie.set_metric(0, 100, "--",
-                                           color="#a8f", dim=True)
+            v = reverse_implied_pct
+            kind, words = self._zone(v, [(10, "good", "low"), (20, "warn", "moderate: pot control"),
+                                         (1e9, "bad", "high: likely second-best")])
+            rows['reverse_implied'] = R("Reverse implied risk", "domination", min(v, 30), 0, 30,
+                                        bands=((0, 10, "good"), (10, 20, "warn"), (20, 30, "bad")),
+                                        text=f"{v:.0f}%", kind=kind, words=words)
+        if stack_bb is not None and 0 < stack_bb <= 15 and hero_hand and len(hero_hand) >= 2:
+            push = nash_push_pct(stack_bb) * 100
+            pct = hand_strength_percentile(hero_hand) * 100
+            shove = pct >= 100 - push
+            rows['nash'] = R("Nash push", f"{stack_bb:.0f} BB, Chen & Ankenman", pct, 0, 100,
+                             bands=((0, 100 - push, "bad"), (100 - push, 100, "good")), target=100 - push,
+                             text=f"top {100 - pct:.0f}%", kind="good" if shove else "bad",
+                             words=f"SHOVE (range: top {push:.0f}%)" if shove else f"FOLD (range: top {push:.0f}%)")
         else:
-            tick = (hero_pfr_pct
-                    if hero_pfr_pct is not None else None)
-            agf_tag = (f"\nAGF {hero_agf:.1f}"
-                       if hero_agf is not None else "")
-            # Color by deviation from "TAG sweet spot" (Hilger Ch 8):
-            #   18-30% VPIP is the working band.
-            if 16 <= hero_vpip_pct <= 30:
-                col = "#88ff88"
-            elif 12 <= hero_vpip_pct <= 40:
-                col = "#ffd966"
-            else:
-                col = "#ff7777"
-            self.hero_vpip_pie.set_metric(
-                hero_vpip_pct, 100,
-                f"{hero_vpip_pct:.0f}%{agf_tag}",
-                tick=tick, color=col)
-
-        # Risk of Ruin (Chen Ch 22). Tight scale (0..10%) since
-        # anything over a few percent is already a problem.
-        if ror_pct is None:
-            self.ror_pie.set_metric(0, 10, "--",
-                                     color="#a8f", dim=True)
-        else:
-            col = ("#88ff88" if ror_pct < 1
-                   else "#ffd966" if ror_pct < 5 else "#ff7777")
-            self.ror_pie.set_metric(
-                min(ror_pct, 10), 10,
-                f"{ror_pct:.1f}%", color=col)
-
-        # Realized equity — % of theoretical equity actually won.
-        # 100% = realising full equity; > 100 squeezing extra; <
-        # 100 spewing.
+            rows['nash'] = R("Nash push", "only at 15 BB or less", kind="info",
+                             words="all-in or no stack" if stack_bb == 0 else "stack too deep to need it")
         if realized_ratio_pct is None:
-            self.realized_pie.set_metric(0, 130, "--",
-                                          color="#a8f", dim=True)
+            rows['realized'] = R("Realized equity", "won ÷ raw equity", lo=0, hi=130, words="after 3 hands",
+                                 kind="info")
         else:
-            mag = min(130.0, max(0.0, realized_ratio_pct))
-            col = ("#88ff88" if realized_ratio_pct >= 95
-                   else "#ffd966" if realized_ratio_pct >= 75
-                   else "#ff7777")
-            self.realized_pie.set_metric(
-                mag, 130, f"{realized_ratio_pct:.0f}%",
-                color=col)
+            v = realized_ratio_pct
+            kind, words = self._zone(v, [(75, "bad", "giving equity away"), (95, "warn", "slightly under"),
+                                         (1e9, "good", "realising your equity")])
+            rows['realized'] = R("Realized equity", "won ÷ raw equity", min(v, 130), 0, 130,
+                                 bands=((0, 75, "bad"), (75, 95, "warn"), (95, 130, "good")), target=100,
+                                 text=f"{v:.0f}%", kind=kind, words=words)
+        # -- you
+        if hero_vpip_pct is None:
+            rows['hero_vpip'] = R("VPIP / PFR", "Hilger, tight-aggressive", lo=0, hi=60, words="after 3 hands",
+                                  kind="info")
+        else:
+            v = hero_vpip_pct
+            kind = ("good" if 16 <= v <= 30 else "warn" if 12 <= v <= 40 else "bad")
+            style = ("tight-aggressive" if kind == "good" else
+                     ("too tight" if v < 16 else "too loose"))
+            agf = f", AGF {hero_agf:.1f}" if hero_agf is not None else ""
+            pfr = f" / {hero_pfr_pct:.0f}%" if hero_pfr_pct is not None else ""
+            rows['hero_vpip'] = R("VPIP / PFR", "Hilger, tight-aggressive", min(v, 60), 0, 60,
+                                  bands=((0, 12, "bad"), (12, 16, "warn"), (16, 30, "good"), (30, 40, "warn"),
+                                         (40, 60, "bad")),
+                                  mark=hero_pfr_pct, text=f"{v:.0f}%{pfr}", kind=kind, words=style + agf)
+        if tilt_score is None:
+            rows['tilt'] = R("Tilt", "Hilger", lo=0, hi=100)
+        else:
+            kind, words = self._zone(tilt_score, [(25, "good", "calm"), (40, "warn", "watch yourself"),
+                                                  (1e9, "bad", "TILT: take a break")])
+            rows['tilt'] = R("Tilt", "Hilger", tilt_score, 0, 100,
+                             bands=((0, 25, "good"), (25, 40, "warn"), (40, 100, "bad")),
+                             text=f"{tilt_score}", kind=kind, words=words)
+        if ror_pct is not None:
+            kind, words = self._zone(ror_pct, [(1, "good", "safe"), (5, "warn", "consider moving down"),
+                                               (1e9, "bad", "bankroll too thin")])
+            rows['bankroll'] = R("Risk of ruin", "Chen & Ankenman", min(ror_pct, 10), 0, 10,
+                                 bands=((0, 1, "good"), (1, 5, "warn"), (5, 10, "bad")),
+                                 text=f"{ror_pct:.1f}%", kind=kind, words=words)
+        elif bankroll_buyins is not None:
+            n = lifetime_hands or 0
+            kind, words = self._zone(bankroll_buyins, [(10, "bad", "thin"), (20, "warn", "workable"),
+                                                       (1e9, "good", "deep enough")])
+            rows['bankroll'] = R("Bankroll depth", f"risk of ruin from hand 100 ({n} so far)",
+                                 min(bankroll_buyins, 40), 0, 40,
+                                 bands=((0, 10, "bad"), (10, 20, "warn"), (20, 40, "good")), target=20,
+                                 text=f"{bankroll_buyins:.0f} buy-ins", kind=kind, words=words)
+        else:
+            rows['bankroll'] = R("Bankroll depth", ror_note or "buy-ins", lo=0, hi=40)
+        self._rows = rows
+        self._title = self._action_title()
+        self.update()
+
+    def _action_title(self):
+        """The headline: the most urgent verdict (bad before warn, in reading order)."""
+        order = [k for _, keys in self.GROUPS for k in keys]
+        for want in ("bad", "warn"):
+            for k in order:
+                r = self._rows.get(k)
+                if r and r["kind"] == want and r["value"] is not None:
+                    return f"{r['label']} {r['text']}: {r['words']}"
+        if any(r["value"] is not None for r in self._rows.values()):
+            return "No warnings: every measured stat is in its good range"
+        return "Waiting for the first decision"
+
+    # ---- painting ---------------------------------------------------------------------
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, self.SURFACE)
+        pad = 14
+        p.setPen(self.TEXT)
+        p.setFont(QFont('Arial', 15, QFont.Weight.Bold))
+        title_rect = QRectF(pad, 8, w - 2 * pad, 48)
+        p.drawText(title_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                                   | Qt.TextFlag.TextWordWrap), self._title)
+        n_rows = sum(len(keys) for _, keys in self.GROUPS)
+        head_h = 26
+        top = 62
+        row_h = max(42.0, (h - top - len(self.GROUPS) * head_h - 6) / n_rows)
+        self._tight = row_h < 50                       # short panel: smaller type so every row fits
+        value_w = 150
+        bar_x0 = pad
+        bar_x1 = pad + (w - 2 * pad) * 0.52
+        self._row_rects = []
+        y = top
+        for gname, keys in self.GROUPS:
+            p.setPen(self.MUTED)
+            p.setFont(QFont('Arial', 11, QFont.Weight.Bold))
+            p.drawText(QRectF(pad, y, w - 2 * pad, head_h - 3),
+                       int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom), gname.upper())
+            p.setPen(QPen(QColor(60, 60, 60), 1))
+            p.drawLine(int(pad), int(y + head_h), int(w - pad), int(y + head_h))
+            y += head_h
+            for k in keys:
+                r = self._rows.get(k)
+                if r is not None:
+                    self._paint_row(p, r, y, row_h, pad, bar_x0, bar_x1, w - pad, value_w)
+                    self._row_rects.append((QRectF(0, y, w, row_h), k))
+                y += row_h
+        p.end()
+
+    def _paint_row(self, p, r, y, row_h, pad, bar_x0, bar_x1, right, value_w):
+        # name (bold) + source (muted)
+        tight = getattr(self, '_tight', False)
+        p.setFont(QFont('Arial', 12 if tight else 14, QFont.Weight.Bold))
+        p.setPen(self.TEXT if r["value"] is not None else self.MUTED)
+        fm = p.fontMetrics()
+        p.drawText(int(pad), int(y + (16 if tight else 20)), r["label"])
+        p.setFont(QFont('Arial', 10 if tight else 11))
+        p.setPen(self.MUTED)
+        p.drawText(int(pad + fm.horizontalAdvance(r["label"]) + 10), int(y + (16 if tight else 20)), r["source"])
+        # value, right-aligned, large
+        p.setFont(QFont('Arial', 15 if tight else 18, QFont.Weight.Bold))
+        p.setPen(self.TEXT if r["value"] is not None else self.MUTED)
+        p.drawText(QRectF(right - value_w, y, value_w, 24 if tight else 28),
+                   int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), r["text"])
+        # bullet bar
+        lo, hi = r["lo"], r["hi"]
+        span = (hi - lo) or 1.0
+        sx = lambda v: bar_x0 + (bar_x1 - bar_x0) * (max(lo, min(hi, v)) - lo) / span
+        bar_top, bar_h = (y + 23, 12) if tight else (y + 28, 14)
+        if r["bands"]:
+            for a, b, kind in r["bands"]:
+                p.fillRect(QRectF(sx(a), bar_top, max(0.0, sx(b) - sx(a)), bar_h), self.BAND[kind])
+        else:
+            p.fillRect(QRectF(bar_x0, bar_top, bar_x1 - bar_x0, bar_h), self.BAND["none"])
+        if r["value"] is not None:
+            x0, x1 = sorted((sx(r["origin"]), sx(r["value"])))
+            p.fillRect(QRectF(x0, bar_top + 4, max(2.0, x1 - x0), bar_h - 8), self.ACCENT)
+        if r["target"] is not None and r["value"] is not None:
+            p.setPen(QPen(QColor(240, 240, 240), 3))
+            tx = int(sx(r["target"]))
+            p.drawLine(tx, int(bar_top - 3), tx, int(bar_top + bar_h + 3))
+        if r["mark"] is not None:
+            p.setPen(QPen(QColor(240, 240, 240), 2))
+            mx = int(sx(r["mark"]))
+            p.drawLine(mx, int(bar_top + 1), mx, int(bar_top + bar_h - 1))
+        # verdict: icon + words, status colour (muted when it is only information)
+        if r["words"]:
+            col = {"good": self.GOOD, "warn": self.WARN, "bad": self.BAD}.get(r["kind"], self.MUTED)
+            icon = self.ICON.get(r["kind"], "")
+            p.setFont(QFont('Arial', 12, QFont.Weight.Bold))
+            p.setPen(col)
+            p.drawText(QRectF(bar_x1 + 12, bar_top - 4, right - bar_x1 - 12, bar_h + 8),
+                       int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                       (f"{icon} " if icon and r["value"] is not None else "") + r["words"])
+
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        for rect, key in self._row_rects:
+            if rect.contains(pos):
+                QToolTip.showText(event.globalPosition().toPoint(), self.TIPS.get(key, ""), self)
+                return
+        QToolTip.hideText()
 
 
 class TheoryOfMindPanel(QWidget):
@@ -5452,6 +5347,11 @@ class TheoryOfMindPanel(QWidget):
                         outs_v = None
                 stack_bb_v = (hero_stack_val / bb_amount
                               if bb_amount else None)
+                # Harrington's M: stack over one round of blinds (no antes here).
+                sb_v = next((sb for sb, bb in BLIND_LEVELS if bb == bb_amount),
+                            bb_amount / 2 if bb_amount else 0)
+                m_ratio_v = (hero_stack_val / (sb_v + bb_amount)
+                             if bb_amount and hero_stack_val > 0 else None)
                 # Reverse-implied risk — heuristic proxy:
                 # Hands that are "good now but vulnerable" sit in the
                 # mid-equity band (40-65%) AND have a domination risk
@@ -5538,6 +5438,9 @@ class TheoryOfMindPanel(QWidget):
                 hero_pfr_pct = None
                 hero_agf = None
                 ror_pct = None
+                ror_note = None
+                bankroll_buyins = None
+                lifetime_hands = None
                 realized_ratio_pct = None
                 if win is not None:
                     hub = getattr(win, '_learning_hub', None)
@@ -5556,8 +5459,14 @@ class TheoryOfMindPanel(QWidget):
                             bankroll = float(QSettings(
                                 'sgl', 'pokerIQ_lifetime').value(
                                 'bankroll', 2000, type=int))
-                            ror_pct = (hub.stats.risk_of_ruin(bankroll)
-                                       * 100.0)
+                            ror = hub.stats.risk_of_ruin(bankroll)
+                            bankroll_buyins = bankroll / STARTING_STACK
+                            lifetime_hands = hub.stats.lifetime_hands
+                            if ror is not None:
+                                ror_pct = ror * 100.0
+                            else:
+                                ror_note = (f"{hub.stats.lifetime_hands}/"
+                                            f"{hub.stats.ROR_MIN_HANDS} hands")
                         except Exception:
                             ror_pct = None
                     # Hero session VPIP / PFR / AGF — from the
@@ -5621,7 +5530,11 @@ class TheoryOfMindPanel(QWidget):
                     hero_pfr_pct=hero_pfr_pct,
                     hero_agf=hero_agf,
                     ror_pct=ror_pct,
+                    ror_note=ror_note,
                     realized_ratio_pct=realized_ratio_pct,
+                    m_ratio=m_ratio_v,
+                    bankroll_buyins=bankroll_buyins,
+                    lifetime_hands=lifetime_hands,
                 )
             except Exception:
                 pass
@@ -7436,7 +7349,7 @@ class HandSummaryDialog(QDialog):
     def __init__(self, street_stats, street_actions, board_by_street, player_results,
                  player_hands=None, made_hands_by_street=None,
                  pot_by_street=None, street_reflections=None,
-                 reflection_status="Awaiting Claude (Opus 4.7) — perfect-hindsight reflections will appear under each street as they finish.",
+                 reflection_status="Awaiting Claude — perfect-hindsight reflections will appear under each street as they finish.",
                  parent=None):
         super().__init__(parent)
         self.street_stats = street_stats  # {street: [(name, true_eq, perc_eq, pot_odds, active, is_hero), ...]}
@@ -7866,29 +7779,18 @@ class StreetBarChart(QWidget):
         painter.setPen(QColor(180, 180, 100))
         painter.drawText(hand_x, 28, "Hand")
 
-        # Bar width based on available space
-        if god_mode:
-            bar_max_width = min((w - equity_x - 320) // 2, 160)
-        else:
-            bar_max_width = min(w - equity_x - 270, 220)
-        bar_max_width = max(bar_max_width, 80)
-
-        if god_mode:
-            real_x = equity_x
-            painter.setPen(QColor(100, 200, 255))
-            painter.drawText(real_x, 28, "True Equity")
-        else:
-            painter.setPen(QColor(100, 255, 100))
-            painter.drawText(equity_x, 28, "Equity")
-
-        # Implied odds header - positioned after equity status column
-        # The actual x position is computed per-row, so just draw header at estimated position
-        if god_mode:
-            odds_header_x = equity_x + bar_max_width * 2 + 110
-        else:
-            odds_header_x = equity_x + bar_max_width + 105
-        painter.setPen(QColor(200, 160, 100))
-        painter.drawText(odds_header_x, 28, "Pot/Implied")
+        # METRICS-1 sprint 2 (2026-10-29): the stats panel's bullet graph per row: equity
+        # against the pot-odds tick over behind / thin / ahead bands; God Mode a dumbbell (open
+        # dot = what the player thinks, filled = the truth); a verdict with an icon and words.
+        verdict_w = 330
+        chart_x0, chart_x1 = equity_x, max(equity_x + 160, w - verdict_w - 20)
+        sx = lambda v: chart_x0 + (chart_x1 - chart_x0) * max(0.0, min(1.0, v))
+        painter.setPen(QColor(100, 200, 255))
+        painter.drawText(equity_x, 28, "Equity against the price")
+        painter.setFont(QFont('Arial', 13))
+        painter.setPen(QColor(150, 150, 150))
+        legend = ("○ thinks  ● truth  | pot odds" if god_mode else "bar = equity  | = pot odds")
+        painter.drawText(chart_x1 + 20, 28, legend)
 
         # Bars are taller (28→38) to balance the larger fonts.
         bar_height = 38
@@ -7953,125 +7855,61 @@ class StreetBarChart(QWidget):
                 painter.drawText(equity_x, y + 26, "(Folded)")
                 continue
 
-            if god_mode and true_equity is not None:
-                # GOD MODE: Show Real, Thinking, Pot Odds
-                diff = abs(true_equity - perceived_equity)
-                big_diff = diff > 0.20
-
-                # Real equity bar
-                real_x = equity_x
-                real_width = int(true_equity * bar_max_width)
-
-                if big_diff:
-                    if true_equity > perceived_equity:
-                        real_color = QColor(50, 200, 50)
-                    else:
-                        real_color = QColor(200, 50, 50)
-                else:
-                    real_color = QColor(100, 180, 220)
-
-                painter.fillRect(real_x, y, bar_max_width, bar_height, QColor(50, 50, 50))
-                painter.fillRect(real_x, y, real_width, bar_height, real_color)
-                painter.setPen(QPen(QColor(80, 80, 80), 1))
-                painter.drawRect(real_x, y, bar_max_width, bar_height)
-
-                painter.setPen(QColor(255, 255, 255))
-                font = QFont('Arial', 19, QFont.Weight.Bold)
-                painter.setFont(font)
-                painter.drawText(real_x + 4, y + 26, f"{true_equity:.0%}")
-
-                # Perceived equity bar
-                think_x = real_x + bar_max_width + 12
-                think_width = int(perceived_equity * bar_max_width)
-
-                if big_diff:
-                    if perceived_equity > true_equity:
-                        think_color = QColor(255, 100, 100)
-                    else:
-                        think_color = QColor(100, 200, 100)
-                else:
-                    think_color = QColor(220, 160, 80)
-
-                painter.fillRect(think_x, y, bar_max_width, bar_height, QColor(50, 50, 50))
-                painter.fillRect(think_x, y, think_width, bar_height, think_color)
-                painter.setPen(QPen(QColor(80, 80, 80), 1))
-                painter.drawRect(think_x, y, bar_max_width, bar_height)
-
-                painter.setPen(QColor(255, 255, 255))
-                painter.drawText(think_x + 4, y + 26, f"{perceived_equity:.0%}")
-
-                # Show equity status indicator after bars in god mode
-                ev_x = think_x + bar_max_width + 14
-                font = QFont('Arial', 19, QFont.Weight.Bold)
-                painter.setFont(font)
-                if true_equity > 0.5:
-                    painter.setPen(QColor(50, 200, 50))
-                    painter.drawText(ev_x, y + 26, "AHEAD")
-                elif true_equity > 0.3:
-                    painter.setPen(QColor(200, 200, 50))
-                    painter.drawText(ev_x, y + 26, "LIVE")
-                else:
-                    painter.setPen(QColor(200, 50, 50))
-                    painter.drawText(ev_x, y + 26, "BEHIND")
-
-                # Implied odds column (god mode)
-                odds_x = ev_x + 100
-                font = QFont('Arial', 17)
-                painter.setFont(font)
-                if pot_odds > 0:
-                    implied = pot_odds * 1.5  # Implied odds estimate: pot odds + future value
-                    # Color: green if equity > implied odds (profitable call)
-                    if true_equity > pot_odds:
-                        painter.setPen(QColor(50, 200, 50))
-                    else:
-                        painter.setPen(QColor(200, 100, 50))
-                    painter.drawText(odds_x, y + 26, f"{pot_odds:.0%}/{implied:.0%}")
-                else:
-                    painter.setPen(QColor(120, 120, 120))
-                    painter.drawText(odds_x, y + 26, "—")
+            po = pot_odds or 0.0
+            mid = y + bar_height // 2
+            band_h = 26
+            top = mid - band_h // 2
+            if po > 0:
+                lo, hi = max(0.0, po - StatsPanel.THIN), min(1.0, po + StatsPanel.THIN)
+                for a, b, c in ((0.0, lo, StatsPanel.BANDS[0]), (lo, hi, StatsPanel.BANDS[1]),
+                                (hi, 1.0, StatsPanel.BANDS[2])):
+                    if b > a:
+                        painter.fillRect(QRectF(sx(a), top, sx(b) - sx(a), band_h), c)
             else:
-                # Normal mode: Just show perceived equity
-                eq_width = int(perceived_equity * bar_max_width)
-                eq_color = self.get_equity_color(perceived_equity)
-
-                painter.fillRect(equity_x, y, bar_max_width, bar_height, QColor(50, 50, 50))
-                painter.fillRect(equity_x, y, eq_width, bar_height, eq_color)
-                painter.setPen(QPen(QColor(80, 80, 80), 1))
-                painter.drawRect(equity_x, y, bar_max_width, bar_height)
-
-                painter.setPen(QColor(255, 255, 255))
-                font = QFont('Arial', 19, QFont.Weight.Bold)
-                painter.setFont(font)
-                painter.drawText(equity_x + 4, y + 26, f"{perceived_equity:.0%}")
-
-                # Show equity status
-                ev_x = equity_x + bar_max_width + 18
-                font = QFont('Arial', 19, QFont.Weight.Bold)
-                painter.setFont(font)
-                if perceived_equity > 0.5:
-                    painter.setPen(QColor(50, 200, 50))
-                    painter.drawText(ev_x, y + 26, "AHEAD")
-                elif perceived_equity > 0.3:
-                    painter.setPen(QColor(200, 200, 50))
-                    painter.drawText(ev_x, y + 26, "LIVE")
-                else:
-                    painter.setPen(QColor(200, 50, 50))
-                    painter.drawText(ev_x, y + 26, "BEHIND")
-
-                # Implied odds column (normal mode)
-                odds_x = ev_x + 100
-                font = QFont('Arial', 17)
-                painter.setFont(font)
-                if pot_odds > 0:
-                    implied = pot_odds * 1.5
-                    if perceived_equity > pot_odds:
-                        painter.setPen(QColor(50, 200, 50))
-                    else:
-                        painter.setPen(QColor(200, 100, 50))
-                    painter.drawText(odds_x, y + 26, f"{pot_odds:.0%}/{implied:.0%}")
-                else:
-                    painter.setPen(QColor(120, 120, 120))
-                    painter.drawText(odds_x, y + 26, "—")
+                painter.fillRect(QRectF(chart_x0, top, chart_x1 - chart_x0, band_h), StatsPanel.BANDS[2])
+            colour = StatsPanel.ACCENT if is_hero else StatsPanel.NEUTRAL
+            dumbbell = god_mode and true_equity is not None and perceived_equity is not None
+            eq = true_equity if dumbbell else perceived_equity
+            if dumbbell:
+                x_t, x_r = sx(perceived_equity), sx(true_equity)
+                painter.setPen(QPen(QColor(150, 150, 150), 2))
+                painter.drawLine(int(x_t), mid, int(x_r), mid)
+                painter.setPen(QPen(colour, 2))
+                painter.setBrush(QColor(30, 30, 30))
+                painter.drawEllipse(QPointF(x_t, mid), 8, 8)
+                painter.setBrush(colour)
+                painter.drawEllipse(QPointF(x_r, mid), 8, 8)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+            elif eq is not None:
+                painter.fillRect(QRectF(chart_x0, mid - 7, sx(eq) - chart_x0, 14), colour)
+            if po > 0:
+                painter.setPen(QPen(QColor(235, 235, 235), 3))
+                painter.drawLine(int(sx(po)), top - 3, int(sx(po)), top + band_h + 3)
+            if eq is None:
+                continue
+            painter.setFont(QFont('Arial', 16, QFont.Weight.Bold))
+            painter.setPen(QColor(230, 230, 230))
+            lab = (f"thinks {perceived_equity:.0%}, has {true_equity:.0%}" if dumbbell
+                   else f"{eq:.0%}")
+            lab_w = painter.fontMetrics().horizontalAdvance(lab)
+            vals = [eq] + ([perceived_equity] if dumbbell else [])
+            right_x = sx(max(vals)) + 14
+            if right_x + lab_w <= chart_x1 - 4:
+                painter.drawText(int(right_x), mid + 7, lab)          # right of the marks
+            elif not dumbbell:                                        # inside the bar's end
+                painter.setPen(QColor(20, 20, 20))
+                painter.drawText(int(sx(eq) - 8 - lab_w), mid + 7, lab)
+            else:                                                     # no room: left of the dots
+                painter.drawText(int(max(chart_x0 + 4, sx(min(vals)) - 14 - lab_w)), mid + 7, lab)
+            icon, words, kind = StatsPanel.verdict(eq, po)
+            if dumbbell and abs(true_equity - perceived_equity) > 0.20:
+                words += ", overconfident" if perceived_equity > true_equity else ", underestimates"
+            painter.setPen({"good": StatsPanel.GOOD, "thin": StatsPanel.WARN,
+                            "bad": StatsPanel.BAD}[kind])
+            painter.setFont(QFont('Arial', 16, QFont.Weight.Bold))
+            painter.drawText(QRectF(chart_x1 + 20, y, verdict_w, bar_height),
+                             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                                 | Qt.TextFlag.TextWordWrap), f"{icon} {words}")
 
     def get_equity_color(self, equity):
         if equity < 0.3:
@@ -8432,8 +8270,7 @@ def _claude_invoke_args(prompt: str, *, mode: str = 'critique') -> list:
         '--thinking', 'enabled',
         '--max-turns', '1',
         # JSON output so the caller can parse `modelUsage` and surface
-        # a friendly model label ("Claude Opus 4.7 — Hero" rather than
-        # the bare "Claude").
+        # the "Claude — Hero" label.
         '--output-format', 'json',
         prompt,
     ]
@@ -8573,33 +8410,10 @@ class ClaudeAnalysisThread(QThread):
             prompt = self._build_prompt(name)
             text = ""
             model_label = ""
-            try:
-                # Opus 4.7 with --thinking can take a while; bump the timeout.
-                result = subprocess.run(
-                    _claude_invoke_args(prompt, mode=self._mode),
-                    capture_output=True, text=True, timeout=240,
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    try:
-                        payload = _json.loads(result.stdout)
-                        text = (payload.get('result') or '').strip()
-                        model_label = self._friendly_model_label(
-                            payload.get('modelUsage') or {})
-                    except Exception:
-                        # Fall back to raw stdout if JSON parsing fails.
-                        text = result.stdout.strip()
-                if not text or len(text) <= 10:
-                    err_first = ''
-                    if result.stderr:
-                        err_first = result.stderr.strip().splitlines()[0]
-                    detail = f"exit={result.returncode}"
-                    if err_first:
-                        detail += f"; {err_first[:160]}"
-                    text = f"(claude failed: {detail})"
-            except subprocess.TimeoutExpired:
-                text = "(claude timed out after 240s)"
-            except Exception as ex:
-                text = f"(analysis failed: {ex})"
+            for attempt in (1, 2):             # one retry after a failure or timeout
+                text, model_label = self._call_once(prompt, _json, subprocess)
+                if not text.startswith(("(claude failed", "(claude timed out", "(analysis failed")):
+                    break
             results.append({
                 'player': name, 'seat': seat,
                 'text': text, 'model': model_label,
@@ -8608,36 +8422,51 @@ class ClaudeAnalysisThread(QThread):
 
         self.finished_analyses.emit(results)
 
+    def _call_once(self, prompt, _json, subprocess):
+        """One `claude` CLI call: (text, model_label); text is "(claude failed: …)" /
+        "(claude timed out …)" / "(analysis failed: …)" on failure."""
+        text = ""
+        model_label = ""
+        try:
+            # Extended thinking can take a while; generous timeout.
+            result = subprocess.run(
+                _claude_invoke_args(prompt, mode=self._mode),
+                capture_output=True, text=True, timeout=240,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                try:
+                    payload = _json.loads(result.stdout)
+                    text = (payload.get('result') or '').strip()
+                    if payload.get('is_error'):
+                        # The CLI can exit 0 with an error message as its
+                        # result (usage limit, login, overload): not notes.
+                        return f"(claude failed: {text[:200] or 'error'})", ""
+                    model_label = self._friendly_model_label(
+                        payload.get('modelUsage') or {})
+                except Exception:
+                    # Fall back to raw stdout if JSON parsing fails.
+                    text = result.stdout.strip()
+            if not text or len(text) <= 10:
+                err_first = ''
+                if result.stderr:
+                    err_first = result.stderr.strip().splitlines()[0]
+                detail = f"exit={result.returncode}"
+                if err_first:
+                    detail += f"; {err_first[:160]}"
+                text = f"(claude failed: {detail})"
+        except subprocess.TimeoutExpired:
+            text = "(claude timed out after 240s)"
+        except Exception as ex:
+            text = f"(analysis failed: {ex})"
+        return text, model_label
+
     @staticmethod
     def _friendly_model_label(model_usage: dict) -> str:
-        """Pick the dominant model from `modelUsage` and prettify the
-        slug, e.g. 'claude-haiku-4-5-20251001' -> 'Claude Haiku 4.5'."""
+        """The label shown over Claude's analysis: plain "Claude" (no model
+        name or version), or "" when the reply carried no model usage."""
         if not model_usage:
             return ""
-
-        def _score(entry):
-            if not isinstance(entry, dict):
-                return 0
-            return (int(entry.get('inputTokens') or 0)
-                    + int(entry.get('outputTokens') or 0)
-                    + int(entry.get('cacheReadInputTokens') or 0)
-                    + int(entry.get('cacheCreationInputTokens') or 0))
-
-        slug = max(model_usage.keys(), key=lambda k: _score(model_usage[k]))
-        # Strip an "[1m]"-style suffix and the trailing -YYYYMMDD date.
-        core = slug.split('[', 1)[0]
-        parts = core.split('-')
-        if parts and parts[-1].isdigit() and len(parts[-1]) == 8:
-            parts = parts[:-1]
-        # parts now look like e.g. ['claude', 'haiku', '4', '5'] or
-        # ['claude', 'opus', '4', '7'].  Re-emit with title case and
-        # join the trailing version digits with a dot.
-        if len(parts) >= 4 and parts[0] == 'claude':
-            family = parts[1].title()
-            ver = '.'.join(parts[2:])
-            return f"Claude {family} {ver}"
-        # Fallback: just title-case the slug.
-        return ' '.join(p.title() for p in parts) or slug
+        return "Claude"
 
 
 # --- Main Game Window ---
@@ -9522,9 +9351,22 @@ class PokerWindow(QMainWindow):
         import shutil
         if not shutil.which('claude'):
             return None
-        log_text = self._get_current_hand_log()
-        if not log_text:
+        raw_log = self._get_current_hand_log()
+        try:
+            numbered, _ = self._format_hand_log_compact()
+        except Exception:
+            numbered = ""
+        if not numbered and not raw_log:
             return None
+        # Claude annotates by action number, and the Hand Log places each
+        # note under the action with that number, so Claude must see the
+        # Hand Log's own numbering. The raw table log (no numbers) follows
+        # for context only.
+        log_text = numbered
+        if raw_log:
+            log_text += ("\n\nFull table log of the same hand, for context "
+                         "only (unnumbered; annotate using the action "
+                         "numbers above):\n\n" + raw_log)
 
         hero_seat = self.my_seat if self.my_seat is not None else 0
         if not (0 <= hero_seat < len(self.players)):
@@ -9550,14 +9392,23 @@ class PokerWindow(QMainWindow):
                     }
                 else:
                     ann_text = (analyses[0].get('text', '') or '').strip()
+                    self._record_claude_reply(hand, ann_text)
                     actions_text, retro = self._split_retrospective(ann_text)
+                    streets = self._parse_per_street_retrospective(retro)
+                    failed = ann_text.startswith(
+                        ("(claude failed", "(claude timed out", "(analysis failed"))
                     self._hand_reflection_cache[hand] = {
                         'annotations':
                             self._parse_claude_annotations(actions_text),
-                        'street_reflections':
-                            self._parse_per_street_retrospective(retro),
+                        'street_reflections': streets,
                         'retrospective_raw': retro,
-                        'status': '',
+                        # Without per-street notes the Stats rows would keep
+                        # saying "Awaiting Claude" after Claude has finished.
+                        'status': ('' if streets else
+                                   f"Claude didn't answer: {ann_text.strip('()')}"
+                                   if failed else
+                                   'Claude finished but gave no per-street '
+                                   'notes for this hand.'),
                     }
             finally:
                 self._hand_reflection_threads.pop(hand, None)
@@ -9572,6 +9423,17 @@ class PokerWindow(QMainWindow):
         self._claude_threads.append(thread)
         thread.start()
         return thread
+
+    def _record_claude_reply(self, hand: int, text: str):
+        """Append Claude's raw reply for a hand to <session log>_claude.txt, so a
+        missing or failed analysis can be traced afterwards."""
+        try:
+            path = os.path.splitext(self.log_filename)[0] + "_claude.txt"
+            with open(path, 'a') as f:
+                f.write(f"===== HAND #{hand} — {datetime.now():%H:%M:%S}\n"
+                        f"{text}\n\n")
+        except Exception:
+            pass
 
     def _subscribe_summary_to_reflections(self, dialog):
         """Wire a ``HandSummaryDialog`` to the shared per-hand Claude
@@ -11147,6 +11009,8 @@ class PokerWindow(QMainWindow):
         # click "New Hand" mid-hand and burn other players' blinds.
         if getattr(self, '_hand_in_progress', False):
             return
+        # Keep the finished hand's full log for Save Game (whole game).
+        self._archive_finished_hand()
         # If the hero is still parked in spectator mode from the previous
         # hand (paging through streets), tear that UI down before starting
         # the next hand. God Mode / Show Tells revert to whatever they
@@ -13764,7 +13628,8 @@ class PokerWindow(QMainWindow):
         for line in lines:
             if (line.startswith("---") or line.startswith("Hero is")
                     or line.startswith("Hands") or line.startswith("  HERO")
-                    or line.startswith("      ") or line.startswith("===")):
+                    or line.startswith("      ") or line.startswith("===")
+                    or line.startswith("  (no betting")):
                 numbered.append(line)
             else:
                 idx += 1
@@ -13787,8 +13652,10 @@ class PokerWindow(QMainWindow):
         if not retrospective_text:
             return out
         import re
+        # The marker may stand alone on its line or start the paragraph
+        # ("STREET[Flop]: On 9d4d6c ..."), with or without markdown.
         pat = re.compile(
-            r'(?im)^\s*STREET\s*\[\s*(Preflop|Flop|Turn|River)\s*\]\s*:\s*$'
+            r'(?im)^[\s*#_]*STREET\s*\[\s*(Preflop|Flop|Turn|River)\s*\][*_]*\s*:?[*_]*[ \t]*'
         )
         matches = list(pat.finditer(retrospective_text))
         if not matches:
@@ -13813,8 +13680,12 @@ class PokerWindow(QMainWindow):
         if not annotation_text:
             return "", ""
         import re
-        m = re.search(r'(?im)^\s*RETROSPECTIVE\s*:\s*$', annotation_text)
+        m = re.search(r'(?im)^[\s*#_]*RETROSPECTIVE[*_]*\s*:?[*_]*\s*$', annotation_text)
         if not m:
+            # No marker: the per-street paragraphs, if any, start the retrospective.
+            m2 = re.search(r'(?im)^[\s*#_]*STREET\s*\[', annotation_text)
+            if m2:
+                return annotation_text[:m2.start()].rstrip(), annotation_text[m2.start():].strip()
             return annotation_text, ""
         return annotation_text[:m.start()].rstrip(), annotation_text[m.end():].strip()
 
@@ -13979,7 +13850,7 @@ class PokerWindow(QMainWindow):
 
         # While Claude is running we show progress; the merged view replaces
         # this pane once it's done.
-        progress_label = QLabel("Running Claude (Opus 4.7 thinking)…")
+        progress_label = QLabel("Running Claude…")
         progress_label.setFont(QFont('Arial', SUMMARY_PT))
         progress_label.setStyleSheet("color: #bff;")
         content_layout.addWidget(progress_label)
@@ -14848,8 +14719,8 @@ predicted ranges matched actual holdings - use this to improve your reads!</p>
         act_save = QAction("&Save Game…", self)
         act_save.setShortcut("Ctrl+S")
         act_save.setStatusTip(
-            "Save the full game state (stacks, hands, board, blinds, "
-            "history) to a JSON file you can load later")
+            "Save the whole game (every hand's log, plus stacks, board "
+            "and blinds to resume from) to a JSON file you can load later")
         act_save.triggered.connect(self._menu_save_game)
         file_menu.addAction(act_save)
 
@@ -14949,9 +14820,30 @@ predicted ranges matched actual holdings - use this to improve your reads!</p>
             'total_invested': int(getattr(p, 'total_invested', 0)),
         }
 
+    def _archive_finished_hand(self):
+        """Add the last finished hand's full log block to ``_game_hands``
+        (once per hand), so Save Game can write every hand of the game,
+        not just the table state."""
+        hands = self.__dict__.setdefault('_game_hands', [])
+        n = int(getattr(self, 'hand_number', 0) or 0)
+        if n <= 0 or getattr(self, '_hand_in_progress', False):
+            return
+        # After Load Game, hands up to the loaded hand number come from the
+        # save file; this session's log does not hold them.
+        if n <= getattr(self, '_archive_floor', 0):
+            return
+        if hands and hands[-1].get('hand') == n:
+            return
+        block = self._get_current_hand_log()
+        if block:
+            hands.append({'hand': n, 'log': block})
+
     def _build_save_state(self) -> dict:
-        """Snapshot every attribute the table needs to resume play."""
+        """Snapshot every attribute the table needs to resume play, plus
+        the full log of every finished hand of the game ('hands')."""
+        self._archive_finished_hand()
         return {
+            'hands': list(getattr(self, '_game_hands', [])),
             'pokerIQ_save_version': self.SAVE_VERSION,
             'saved_at': datetime.now().isoformat(timespec='seconds'),
             'players': [self._serialize_player(p) for p in self.players],
@@ -15095,7 +14987,7 @@ predicted ranges matched actual holdings - use this to improve your reads!</p>
                 "Disconnect first if you want to snapshot a hand.")
             return
         default_name = (
-            f"pokerIQ_hand{self.hand_number}_"
+            f"pokerIQ_game_{self.hand_number}hands_"
             f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         )
         path, _ = QFileDialog.getSaveFileName(
@@ -15119,7 +15011,8 @@ predicted ranges matched actual holdings - use this to improve your reads!</p>
         # on the left of the dialog, mirroring the Tilt-Anatomy fix.
         box.setIcon(QMessageBox.Icon.NoIcon)
         box.setWindowTitle("Save Game")
-        box.setText(f"Game state saved to:\n{path}")
+        box.setText(f"Game saved ({len(payload.get('hands', []))} hands, "
+                    f"plus the table state to resume from) to:\n{path}")
         box.setStyleSheet(
             "QMessageBox { font-size: 19pt; }"
             "QMessageBox QLabel { font-size: 19pt; min-width: 640px;"
@@ -15224,6 +15117,10 @@ predicted ranges matched actual holdings - use this to improve your reads!</p>
         self.action_history = list(payload.get('action_history') or [])
         self.starting_stacks = dict(payload.get('starting_stacks') or {})
         self.hand_history = dict(payload.get('hand_history') or {})
+        # Earlier hands of the game (saves before 2026-10-29 have none), so
+        # a later save still holds the whole game.
+        self._game_hands = list(payload.get('hands') or [])
+        self._archive_floor = self.hand_number
 
         # Make sure transient flags don't keep stale UI state visible.
         self.waiting_for_human = False
@@ -16705,20 +16602,23 @@ class SessionStats:
         edge = self.lifetime_bb_per_100 / 100.0  # bb per hand
         return ((edge - 1.96 * se) * 100.0, (edge + 1.96 * se) * 100.0)
 
-    def risk_of_ruin(self, bankroll_dollars: float) -> float:
+    ROR_MIN_HANDS = 100
+
+    def risk_of_ruin(self, bankroll_dollars: float) -> float | None:
         """Chen Ch 22: ROR ≈ exp(-2 * win * B / σ²).
 
-        Returns probability in [0,1].  When stats are too thin to compute
-        we return 1.0 (no edge proven yet → assume worst case).
+        Returns a probability in [0,1], or None while there are fewer than
+        ROR_MIN_HANDS lifetime hands (too few to estimate the win rate; it
+        used to report 100% then). A losing or break-even record is 1.0.
         """
-        if self.lifetime_hands < 100:
-            return 1.0
+        if self.lifetime_hands < self.ROR_MIN_HANDS:
+            return None
         mean = self.lifetime_profit / self.lifetime_hands
         if mean <= 0:
             return 1.0
         var = self.lifetime_std ** 2
         if var <= 0:
-            return 1.0
+            return None
         return math.exp(-2.0 * mean * bankroll_dollars / var)
 
     def kelly_fraction(self) -> float:
@@ -17728,6 +17628,8 @@ class VarianceDashboard(QDialog):
         b = float(self.bankroll_box.value())
         edge_lo, edge_hi = s.edge_confidence_interval()
         ror = s.risk_of_ruin(b)
+        ror_txt = (f"{ror*100:.1f}%" if ror is not None else
+                   f"needs {s.ROR_MIN_HANDS} hands ({s.lifetime_hands} so far)")
         kelly = s.kelly_fraction()
         rec_buyin = max(20.0, kelly * b * 0.5)  # half-Kelly
         body = (
@@ -17742,7 +17644,7 @@ class VarianceDashboard(QDialog):
             f"  bb/100:          {s.lifetime_bb_per_100:+.1f}<br>"
             f"  σ:               {s.lifetime_std:.2f}<br>"
             f"  Edge 95% CI:     [{edge_lo:+.1f}, {edge_hi:+.1f}] bb/100<br>"
-            f"  Risk of Ruin:    <b>{ror*100:.1f}%</b> "
+            f"  Risk of Ruin:    <b>{ror_txt}</b> "
             f"(Chen Ch 22: exp(-2μB/σ²))<br>"
             f"  Kelly fraction:  {kelly:.3f}  →  half-Kelly buy-in "
             f"≈ <b>${rec_buyin:,.0f}</b><br>"
