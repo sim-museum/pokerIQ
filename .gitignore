@@ -1,0 +1,7 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Session logs (created when you play)
+poker_log_*.txt

@@ -1,0 +1,552 @@
+"""Network dialogs for hosting and joining poker games."""
+
+from typing import Optional, Dict
+from PyQt6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QLineEdit, QSpinBox, QGroupBox, QRadioButton, QButtonGroup,
+    QMessageBox, QFrame, QGridLayout, QWidget, QListWidget, QListWidgetItem
+)
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+from PyQt6.QtGui import QFont
+
+from .protocol import DEFAULT_PORT, MAX_NAME_LEN
+from .server import PokerServer
+from .client import PokerClient
+from . import serious_games_week
+
+
+def _validate_short_name(name: str) -> Optional[str]:
+    """Return an error string if name is invalid, else None."""
+    stripped = (name or "").strip()
+    if not stripped:
+        return "Name cannot be empty."
+    if len(stripped) > MAX_NAME_LEN:
+        return f"Name too long ({len(stripped)} chars). Max is {MAX_NAME_LEN}."
+    return None
+
+
+def _get_local_lan_ips():
+    """Return a sorted list of likely LAN IPv4 addresses for this
+    machine. Excludes loopback and link-local. The UDP-connect-to-
+    8.8.8.8 trick reliably picks the primary LAN-facing interface
+    even when /proc/net is unhelpful; gethostbyname_ex acts as a
+    backup. Returns [] if nothing usable is found.
+    """
+    import socket
+    ips = set()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(('8.8.8.8', 80))
+            ips.add(s.getsockname()[0])
+        finally:
+            s.close()
+    except Exception:
+        pass
+    try:
+        host = socket.gethostname()
+        for addr in socket.gethostbyname_ex(host)[2]:
+            ips.add(addr)
+    except Exception:
+        pass
+    return sorted(ip for ip in ips
+                  if ip and not ip.startswith('127.')
+                  and not ip.startswith('169.254.'))
+
+
+class HostGameDialog(QDialog):
+    """Dialog for hosting a poker game."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Host Poker Game")
+        self.setMinimumWidth(350)
+
+        self.server: Optional[PokerServer] = None
+        self.host_name: str = "Host"
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Server settings
+        settings_group = QGroupBox("Server Settings")
+        settings_layout = QGridLayout()
+
+        settings_layout.addWidget(QLabel("Your Name:"), 0, 0)
+        self.host_name_edit = QLineEdit("Host")
+        self.host_name_edit.setMaxLength(MAX_NAME_LEN)
+        self.host_name_edit.setPlaceholderText(f"Short name (≤{MAX_NAME_LEN} chars)")
+        settings_layout.addWidget(self.host_name_edit, 0, 1)
+
+        settings_layout.addWidget(QLabel("Table Name:"), 1, 0)
+        self.name_edit = QLineEdit("Poker Table")
+        settings_layout.addWidget(self.name_edit, 1, 1)
+
+        settings_layout.addWidget(QLabel("Port:"), 2, 0)
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1024, 65535)
+        self.port_spin.setValue(DEFAULT_PORT)
+        settings_layout.addWidget(self.port_spin, 2, 1)
+
+        # Show the host's LAN IP address(es) right in the dialog so
+        # the user can read them off to guests BEFORE clicking Start
+        # Server (mirroring the ben_bridge host dialog). Selectable so
+        # the user can copy-paste into chat / email. Updates live when
+        # the port spin value changes.
+        settings_layout.addWidget(QLabel("Your IP:"), 3, 0)
+        self.host_ip_label = QLabel("")
+        self.host_ip_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.host_ip_label.setStyleSheet(
+            "QLabel { color: #2a7a2a; font-weight: bold; }")
+        self.host_ip_label.setWordWrap(True)
+        settings_layout.addWidget(self.host_ip_label, 3, 1)
+
+        settings_layout.addWidget(QLabel("Seats:"), 4, 0)
+        self.seats_spin = QSpinBox()
+        self.seats_spin.setRange(2, 10)
+        self.seats_spin.setValue(6)
+        settings_layout.addWidget(self.seats_spin, 4, 1)
+
+        settings_layout.addWidget(QLabel("Password:"), 5, 0)     # backlog 55: optional, blank = open table
+        self.password_edit = QLineEdit("")
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_edit.setPlaceholderText("optional -- blank = open table")
+        settings_layout.addWidget(self.password_edit, 5, 1)
+
+        settings_group.setLayout(settings_layout)
+        layout.addWidget(settings_group)
+
+        # Cache the LAN-IP list once. The label doesn't include the
+        # port (port has its own spinbox above), so there's nothing
+        # to refresh on port changes.
+        self._lan_ips = _get_local_lan_ips()
+        self._refresh_host_ip_label()
+
+        # Status
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: gray;")
+        layout.addWidget(self.status_label)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self.start_btn = QPushButton("Start Server")
+        self.start_btn.clicked.connect(self._start_server)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(self.start_btn)
+        btn_layout.addWidget(self.cancel_btn)
+        layout.addLayout(btn_layout)
+
+    def _refresh_host_ip_label(self):
+        """Re-render the Your-IP line using the cached LAN-IP list.
+        The port lives in its own spinbox row above, so we show the
+        bare IP here — no `:port` suffix.
+        """
+        if not self._lan_ips:
+            self.host_ip_label.setText(
+                "(no LAN IP detected — guests on this machine "
+                "can use 127.0.0.1)"
+            )
+            self.host_ip_label.setStyleSheet(
+                "QLabel { color: #aa6600; font-style: italic; }")
+            return
+        if len(self._lan_ips) == 1:
+            self.host_ip_label.setText(self._lan_ips[0])
+        else:
+            self.host_ip_label.setText("  •  ".join(self._lan_ips))
+        self.host_ip_label.setStyleSheet(
+            "QLabel { color: #2a7a2a; font-weight: bold; }")
+
+    def _start_server(self):
+        """Start the poker server."""
+        host_name = self.host_name_edit.text()
+        err = _validate_short_name(host_name)
+        if err:
+            self.status_label.setText(err)
+            self.status_label.setStyleSheet("color: red;")
+            return
+        host_name = host_name.strip()
+
+        table_name = self.name_edit.text() or "Poker Table"
+        port = self.port_spin.value()
+        num_seats = self.seats_spin.value()
+
+        self.host_name = host_name
+        try:
+            from pokerIQ import APP_VERSION
+        except Exception:
+            APP_VERSION = ""
+        self.server = PokerServer(server_name=table_name, num_seats=num_seats,
+                                   host_seat=0, host_name=host_name,
+                                   app_version=APP_VERSION, password=self.password_edit.text())
+
+        if self.server.start(port):
+            # Serious Games Week: list the table on the player's matchmaker while it is open (withdrawn in PokerServer.stop)
+            self.server.matchmaker.start(port, table_name, name=host_name, max_players=num_seats, version=APP_VERSION)
+            self.status_label.setText(f"Server running on port {port}")
+            self.status_label.setStyleSheet("color: green;")
+            self.start_btn.setEnabled(False)
+            self.accept()
+        else:
+            self.status_label.setText("Failed to start server")
+            self.status_label.setStyleSheet("color: red;")
+            self.server = None
+
+    def get_server(self) -> Optional[PokerServer]:
+        """Get the created server instance."""
+        return self.server
+
+    def get_host_name(self) -> str:
+        """Get the chosen host display name."""
+        return self.host_name
+
+
+class JoinGameDialog(QDialog):
+    """Dialog for joining a poker game."""
+
+    def __init__(self, player_name: str = "Player", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Join Poker Game")
+        self.setMinimumWidth(350)
+
+        self.player_name = player_name
+        self.client: Optional[PokerClient] = None
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Connection settings
+        if serious_games_week.configured():
+            sq_group = QGroupBox("Tables on Serious Games Week")
+            sq_layout = QVBoxLayout()
+            self.matchmaker_list = QListWidget()
+            self.matchmaker_list.setToolTip("Open tables listed on your Serious Games Week matchmaker -- pick one to fill in its address")
+            self.matchmaker_list.currentItemChanged.connect(self._matchmaker_pick)
+            sq_layout.addWidget(self.matchmaker_list)
+            refresh = QPushButton("Refresh")
+            refresh.clicked.connect(self._matchmaker_refresh)
+            sq_layout.addWidget(refresh)
+            sq_group.setLayout(sq_layout)
+            layout.addWidget(sq_group)
+            QTimer.singleShot(0, self._matchmaker_refresh)
+
+        conn_group = QGroupBox("Connection")
+        conn_layout = QGridLayout()
+
+        conn_layout.addWidget(QLabel("Your Name:"), 0, 0)
+        self.name_edit = QLineEdit(self.player_name)
+        self.name_edit.setMaxLength(MAX_NAME_LEN)
+        self.name_edit.setPlaceholderText(f"Short name (≤{MAX_NAME_LEN} chars)")
+        conn_layout.addWidget(self.name_edit, 0, 1)
+
+        conn_layout.addWidget(QLabel("Server IP:"), 1, 0)
+        self.host_edit = QLineEdit("localhost")
+        conn_layout.addWidget(self.host_edit, 1, 1)
+
+        conn_layout.addWidget(QLabel("Port:"), 2, 0)
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1024, 65535)
+        self.port_spin.setValue(DEFAULT_PORT)
+        conn_layout.addWidget(self.port_spin, 2, 1)
+
+        conn_layout.addWidget(QLabel("Password:"), 3, 0)     # backlog 55: the host's, if the table has one
+        self.password_edit = QLineEdit("")
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_edit.setPlaceholderText("only if the host set one")
+        conn_layout.addWidget(self.password_edit, 3, 1)
+
+        conn_group.setLayout(conn_layout)
+        layout.addWidget(conn_group)
+
+        # Status
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: gray;")
+        layout.addWidget(self.status_label)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.clicked.connect(self._connect)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self._cancel)
+        btn_layout.addWidget(self.connect_btn)
+        btn_layout.addWidget(self.cancel_btn)
+        layout.addLayout(btn_layout)
+
+    def _matchmaker_refresh(self):
+        self.matchmaker_list.clear()
+        tables = serious_games_week.list_tables()
+        for t in tables:
+            seats = "%d" % t.get("players", 0) + ("/%d" % t["max_players"] if t.get("max_players") else "")
+            who = (" · " + t["name"]) if t.get("name") else ""
+            item = QListWidgetItem("%s%s  —  %s:%d  (%s)" % (t.get("title", "table"), who, t["host"], t["port"], seats))
+            item.setData(Qt.ItemDataRole.UserRole, (t["host"], int(t["port"])))
+            self.matchmaker_list.addItem(item)
+        if not tables:
+            self.matchmaker_list.addItem("(no open tables on Serious Games Week right now)")
+
+    def _matchmaker_pick(self, item, _prev=None):
+        hp = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if hp:
+            self.host_edit.setText(hp[0])
+            self.port_spin.setValue(hp[1])
+
+    def _connect(self):
+        """Connect to the poker server."""
+        name = self.name_edit.text()
+        err = _validate_short_name(name)
+        if err:
+            self.status_label.setText(err)
+            self.status_label.setStyleSheet("color: red;")
+            return
+        name = name.strip()
+
+        host = self.host_edit.text() or "localhost"
+        port = self.port_spin.value()
+
+        try:
+            from pokerIQ import APP_VERSION
+        except Exception:
+            APP_VERSION = ""
+        self.client = PokerClient(player_name=name, app_version=APP_VERSION, password=self.password_edit.text())
+        self.client.connected.connect(self._on_connected)
+        self.client.connection_failed.connect(self._on_connection_failed)
+
+        self.status_label.setText("Connecting...")
+        self.status_label.setStyleSheet("color: blue;")
+        self.connect_btn.setEnabled(False)
+
+        self.client.connect_to_server(host, port)
+
+    def _on_connected(self, server_name: str):
+        """Handle successful connection."""
+        self.status_label.setText(f"Connected to {server_name}")
+        self.status_label.setStyleSheet("color: green;")
+        self.accept()
+
+    def _on_connection_failed(self, reason: str):
+        """Handle connection failure."""
+        self.status_label.setText(f"Failed: {reason}")
+        self.status_label.setStyleSheet("color: red;")
+        self.connect_btn.setEnabled(True)
+        # Defer destruction — this signal may fire from inside the
+        # client's readyRead handler; destroying the client (and its
+        # QTcpSocket) synchronously while Qt is still processing
+        # socket data causes a segfault.
+        if self.client:
+            self.client.deleteLater()
+            self.client = None
+
+    def _cancel(self):
+        """Cancel and clean up."""
+        if self.client:
+            self.client.disconnect_from_server()
+            self.client = None
+        self.reject()
+
+    def get_client(self) -> Optional[PokerClient]:
+        """Get the created client instance."""
+        return self.client
+
+
+class SeatSelectionDialog(QDialog):
+    """Dialog for selecting a seat at the poker table."""
+
+    seat_selected = pyqtSignal(int)
+
+    def __init__(self, client: PokerClient, num_seats: int = 6, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Choose Your Seat")
+        self.setMinimumSize(500, 400)
+
+        self.client = client
+        self.num_seats = num_seats
+        self.seat_buttons: Dict[int, QPushButton] = {}
+
+        self._setup_ui()
+        self._connect_signals()
+
+        # Request initial seat list
+        if client.seats:
+            self._update_seats(client.seats)
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Title
+        title = QLabel("Select Your Seat")
+        title.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        # Seat grid (arranged to match game table layout)
+        seat_widget = QWidget()
+        seat_layout = QGridLayout(seat_widget)
+        seat_layout.setSpacing(15)
+
+        # Match game table layout (clockwise: 0,1,2,3,4,5):
+        # Top: seats 5 (left), 0 (right) — above table
+        # Right: seats 1, 2 — right of table
+        # Left: seats 4, 3 — left of table
+        positions = [
+            (0, 2),  # Seat 0: top right (Hero/Server)
+            (1, 3),  # Seat 1: right upper
+            (2, 3),  # Seat 2: right lower
+            (2, 0),  # Seat 3: left lower
+            (1, 0),  # Seat 4: left upper
+            (0, 1),  # Seat 5: top left
+        ]
+
+        for i in range(min(self.num_seats, len(positions))):
+            btn = QPushButton(f"Seat {i + 1}\n(Empty)")
+            btn.setMinimumSize(100, 60)
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda checked, seat=i: self._on_seat_clicked(seat))
+            self.seat_buttons[i] = btn
+
+            row, col = positions[i]
+            seat_layout.addWidget(btn, row, col)
+
+        # Add table center label
+        table_label = QLabel("TABLE")
+        table_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        table_label.setStyleSheet("""
+            background-color: #228B22;
+            color: white;
+            border-radius: 10px;
+            padding: 20px;
+            font-weight: bold;
+        """)
+        seat_layout.addWidget(table_label, 1, 1, 2, 2)
+
+        layout.addWidget(seat_widget)
+
+        # Status
+        self.status_label = QLabel("Select an available seat")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.status_label)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self.sit_btn = QPushButton("Sit Down")
+        self.sit_btn.setEnabled(False)
+        self.sit_btn.clicked.connect(self._request_seat)
+        self.leave_btn = QPushButton("Leave Table")
+        self.leave_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(self.sit_btn)
+        btn_layout.addWidget(self.leave_btn)
+        layout.addLayout(btn_layout)
+
+    def _connect_signals(self):
+        """Connect client signals."""
+        self.client.seat_list_received.connect(self._update_seats)
+        self.client.seat_confirmed.connect(self._on_seat_confirmed)
+        self.client.seat_rejected.connect(self._on_seat_rejected)
+        self.client.player_joined.connect(self._on_player_joined)
+        self.client.player_left.connect(self._on_player_left)
+
+    def _update_seats(self, seats: Dict[int, Optional[str]]):
+        """Update seat display."""
+        for i, btn in self.seat_buttons.items():
+            player_name = seats.get(i)
+            if player_name:
+                btn.setText(f"Seat {i + 1}\n{player_name}")
+                btn.setEnabled(False)
+                btn.setStyleSheet("background-color: #FFB6C1;")  # Light pink - taken
+            else:
+                btn.setText(f"Seat {i + 1}\n(Empty)")
+                btn.setEnabled(True)
+                btn.setStyleSheet("background-color: #90EE90;")  # Light green - available
+
+    def _on_seat_clicked(self, seat_index: int):
+        """Handle seat button click."""
+        # Uncheck other buttons
+        for i, btn in self.seat_buttons.items():
+            if i != seat_index:
+                btn.setChecked(False)
+
+        self.selected_seat = seat_index
+        self.sit_btn.setEnabled(True)
+
+    def _request_seat(self):
+        """Request the selected seat."""
+        if hasattr(self, 'selected_seat'):
+            self.status_label.setText("Requesting seat...")
+            self.client.request_seat(self.selected_seat)
+
+    def _on_seat_confirmed(self, seat_index: int):
+        """Handle seat confirmation."""
+        self.status_label.setText(f"You are now in seat {seat_index + 1}")
+        self.seat_selected.emit(seat_index)
+        QTimer.singleShot(500, self.accept)
+
+    def _on_seat_rejected(self, reason: str):
+        """Handle seat rejection."""
+        self.status_label.setText(f"Cannot take seat: {reason}")
+        self.status_label.setStyleSheet("color: red;")
+
+    def _on_player_joined(self, name: str):
+        """Handle player join notification."""
+        self.status_label.setText(f"{name} joined the table")
+
+    def _on_player_left(self, name: str):
+        """Handle player left notification."""
+        self.status_label.setText(f"{name} left the table")
+
+
+class NetworkModeDialog(QDialog):
+    """Dialog for choosing network mode (host or join)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Network Play")
+        self.setMinimumWidth(300)
+
+        self.mode: Optional[str] = None
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Title
+        title = QLabel("Choose Network Mode")
+        title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        layout.addSpacing(20)
+
+        # Host button
+        host_btn = QPushButton("Host Game")
+        host_btn.setMinimumHeight(50)
+        host_btn.setToolTip("Start a server for others to join")
+        host_btn.clicked.connect(self._select_host)
+        layout.addWidget(host_btn)
+
+        # Join button
+        join_btn = QPushButton("Join Game")
+        join_btn.setMinimumHeight(50)
+        join_btn.setToolTip("Connect to an existing server")
+        join_btn.clicked.connect(self._select_join)
+        layout.addWidget(join_btn)
+
+        layout.addSpacing(10)
+
+        # Cancel button
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        layout.addWidget(cancel_btn)
+
+    def _select_host(self):
+        self.mode = "host"
+        self.accept()
+
+    def _select_join(self):
+        self.mode = "join"
+        self.accept()
+
+    def get_mode(self) -> Optional[str]:
+        return self.mode
